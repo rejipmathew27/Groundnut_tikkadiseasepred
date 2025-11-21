@@ -207,10 +207,26 @@ if page == "Predict Disease":
                         
                         # Show probability distribution
                         with st.expander("View detailed probability scores"):
-                            prob_df = pd.DataFrame({
-                                'Severity Level': [class_indices[k] for k in sorted(class_indices.keys())],
-                                'Probability (%)': [p * 100 for p in all_probs]
-                            })
+                            # Map numerical indices to severity names
+                            class_map = {v: SEVERITY_LEVELS.get(int(k), f"Class {k}") for k, v in class_indices.items()}
+                            
+                            prob_data = []
+                            # Ensure all classes in class_indices are included and probabilities are aligned
+                            sorted_indices = sorted(class_indices.values())
+                            sorted_class_names = [class_map.get(i, f"Class {i}") for i in sorted_indices]
+                            
+                            for i in sorted_indices:
+                                # Find the original class name (key) corresponding to the index (value)
+                                original_class_key = next((k for k, v in class_indices.items() if v == i), f"Class {i}")
+                                # Use SEVERITY_LEVELS for display if available, fallback to original key
+                                display_name = SEVERITY_LEVELS.get(i, original_class_key)
+                                
+                                prob_data.append({
+                                    'Severity Level': display_name,
+                                    'Probability (%)': all_probs[i] * 100
+                                })
+                                
+                            prob_df = pd.DataFrame(prob_data)
                             st.dataframe(prob_df, use_container_width=True)
                         
                         st.markdown("---")
@@ -256,12 +272,13 @@ elif page == "Train Model":
     ├── moderate/
     └── severe/
     ```
-    2. Enter the path to your training_data folder
+    2. Enter the path to your **training\_data** folder
     3. Configure training parameters
     4. Click 'Start Training'
     """)
     
-    training_path = st.text_input("Training Data Path", "training_data")
+    # MODIFICATION: Set the default value to the desired path
+    training_path = st.text_input("Training Data Path", **r"F:\ML_images\Trainingdata"**) 
     epochs = st.slider("Number of Epochs", 5, 50, 10)
     
     if st.button("🚀 Start Training"):
@@ -308,7 +325,7 @@ else:  # About page
     (also known as leaf spot disease) in groundnut (peanut) plants.
     
     #### Features:
-    - **AI-Powered Detection**: Uses MobileNetV2 transfer learning for accurate classification
+    - **AI-Powered Detection**: Uses **MobileNetV2** transfer learning for accurate classification
     - **Severity Scoring**: Classifies disease into 4 levels (Healthy, Mild, Moderate, Severe)
     - **Batch Processing**: Analyze multiple leaf images simultaneously
     - **Confidence Scores**: Provides probability scores for each prediction
@@ -347,4 +364,5 @@ st.sidebar.info("""
 - Focus on affected leaf areas
 - Capture multiple angles
 - Ensure leaves are in focus
+
 """)
