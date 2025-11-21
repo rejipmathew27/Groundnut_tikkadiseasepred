@@ -10,6 +10,10 @@ import os
 import pandas as pd
 from datetime import datetime
 import io
+import zipfile # Import for handling ZIP files
+import shutil # Import for file operations
+
+# --- CONFIGURATION ---
 
 # Set page config
 st.set_page_config(
@@ -21,6 +25,10 @@ st.set_page_config(
 # Constants
 IMG_SIZE = 224
 BATCH_SIZE = 32
+MODEL_FILE = 'tikka_disease_model.h5'
+INDICES_FILE = 'class_indices.npy'
+TEMP_DIR = "temp_training_data" # Directory to extract ZIP files
+
 # Ensure SEVERITY_LEVELS keys match the expected output indices (0, 1, 2, 3)
 SEVERITY_LEVELS = {
     0: "Healthy",
@@ -35,10 +43,11 @@ SEVERITY_COLORS = {
     3: "red"
 }
 
+# --- MODEL FUNCTIONS ---
+
 # Model building function
 def create_model(num_classes=4):
     """Create a transfer learning model using MobileNetV2"""
-    # Use context manager for memory efficiency (though less critical here)
     with st.spinner('Loading base model weights...'):
         base_model = MobileNetV2(
             input_shape=(IMG_SIZE, IMG_SIZE, 3),
@@ -83,7 +92,6 @@ def train_model(training_path, epochs=10):
         shear_range=0.2
     )
     
-    # Check if any images are found
     try:
         train_generator = train_datagen.flow_from_directory(
             training_path,
@@ -93,10 +101,11 @@ def train_model(training_path, epochs=10):
             subset='training'
         )
     except Exception as e:
+        # Re-raise with context for debugging
         raise FileNotFoundError(f"Error loading training data. Check the path and folder structure: {e}")
 
     if train_generator.samples == 0:
-        raise ValueError("No training images found in the specified path. Check subdirectories.")
+        raise ValueError("No training images found in the specified path. Check subdirectories/unzipped structure.")
 
     val_generator = train_datagen.flow_from_directory(
         training_path,
@@ -127,35 +136,89 @@ def predict_image(model, image, class_indices):
     
     predictions = model.predict(img_array, verbose=0)
     
-    # Check if the number of classes in the loaded model matches SEVERITY_LEVELS
     if predictions.shape[1] != len(SEVERITY_LEVELS):
-        st.warning(f"Model was trained with {predictions.shape[1]} classes, but expected {len(SEVERITY_LEVELS)}. Results might be mapped incorrectly.")
+        st.warning(f"Model trained with {predictions.shape[1]} classes. Expected {len(SEVERITY_LEVELS)}. Results might be mapped incorrectly.")
 
     predicted_class_index = np.argmax(predictions[0])
     confidence = predictions[0][predicted_class_index] * 100
     
-    # MODIFICATION: Use SEVERITY_LEVELS based on the index for display
-    # We rely on the class_indices map to link folder names to indices for proper mapping
-    # The actual class index (0, 1, 2, 3) must be the key for SEVERITY_LEVELS.
     severity_name = SEVERITY_LEVELS.get(predicted_class_index, f"Unknown Class Index {predicted_class_index}")
     
     return predicted_class_index, confidence, severity_name, predictions[0]
 
 # Save/Load model functions
+def save_model(model, class_indices):
+    """Save model and class indices using cross-platform paths"""
+    model.save(os.path.join(MODEL_FILE))
+    np.save(os.path.join(INDICES_FILE), class_indices)
+    
 @st.cache_resource
 def load_model():
-    """Load saved model and class indices"""
-    if os.path.exists('tikka_disease_model.h5') and os.path.exists('class_indices.npy'):
+    """Load saved model and class indices using cross-platform paths"""
+    model_path = os.path.join(MODEL_FILE)
+    indices_path = os.path.join(INDICES_FILE)
+
+    if os.path.exists(model_path) and os.path.exists(indices_path):
         try:
-            model = keras.models.load_model('tikka_disease_model.h5')
-            class_indices = np.load('class_indices.npy', allow_pickle=True).item()
+            model = keras.models.load_model(model_path)
+            class_indices = np.load(indices_path, allow_pickle=True).item()
             return model, class_indices
         except Exception as e:
             st.error(f"Failed to load model or indices: {e}")
             return None, None
     return None, None
 
-# Streamlit UI
+# --- NEW FUNCTION FOR ZIP UPLOAD HANDLER ---
+
+def unzip_and_train(uploaded_zip_file, epochs):
+    """Handles the extraction of ZIP data and initiates model training."""
+    
+    # 1. Clean up old temporary directory if it exists
+    if os.path.exists(TEMP_DIR):
+        shutil.rmtree(TEMP_DIR)
+    os.makedirs(TEMP_DIR, exist_ok=True)
+    
+    # 2. Save the uploaded file to a temporary disk location
+    zip_path = os.path.join(TEMP_DIR, uploaded_zip_file.name)
+    with open(zip_path, "wb") as f:
+        f.write(uploaded_zip_file.getbuffer())
+
+    # 3. Extract the contents
+    try:
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            zip_ref.extractall(TEMP_DIR)
+        
+        # 4. Find the actual training directory inside the extracted files
+        # Assumption: The ZIP contains a single root folder (e.g., training_data/)
+        extracted_contents = os.listdir(TEMP_DIR)
+        
+        # Look for the directory that contains the class folders (healthy, mild, etc.)
+        training_root = TEMP_DIR
+        if len(extracted_contents) == 1 and os.path.isdir(os.path.join(TEMP_DIR, extracted_contents[0])):
+            # If the zip extracted into a single folder (e.g., temp_training_data/training_data/)
+            training_root = os.path.join(TEMP_DIR, extracted_contents[0])
+
+        # 5. Start Training
+        model, history, class_indices = train_model(training_root, epochs)
+        
+        # 6. Clean up temporary files after successful training
+        shutil.rmtree(TEMP_DIR)
+        
+        return model, history, class_indices
+
+    except zipfile.BadZipFile:
+        st.error("❌ Invalid ZIP file. Please ensure the file is not corrupted.")
+        shutil.rmtree(TEMP_DIR)
+        return None, None, None
+    except Exception as e:
+        st.error(f"❌ Training setup failed: {e}")
+        # Attempt to clean up even if training failed
+        if os.path.exists(TEMP_DIR):
+             shutil.rmtree(TEMP_DIR)
+        return None, None, None
+
+# --- STREAMLIT UI ---
+
 st.title("🌿 Groundnut Tikka Leaf Disease Detection System")
 st.markdown("### AI-Powered Disease Identification and Severity Scoring")
 
@@ -167,7 +230,6 @@ page = st.sidebar.radio("Select Page", ["Predict Disease", "Train Model", "About
 if page == "Predict Disease":
     st.header("📸 Upload Groundnut Leaf Images")
     
-    # Load model (using cached function)
     model, class_indices = load_model()
     
     if model is None:
@@ -175,7 +237,6 @@ if page == "Predict Disease":
     else:
         st.success("✅ Model loaded successfully!")
         
-        # File uploader
         uploaded_files = st.file_uploader(
             "Choose groundnut leaf images",
             type=['jpg', 'jpeg', 'png'],
@@ -205,7 +266,6 @@ if page == "Predict Disease":
                         st.image(image, caption=uploaded_file.name, use_container_width=True)
                         
                         # Display prediction
-                        # Use the predicted index for color mapping
                         severity_color = SEVERITY_COLORS.get(pred_class, "gray")
                         st.markdown(f"**Status:** :{severity_color}[{severity_name}]")
                         st.markdown(f"**Confidence:** {confidence:.2f}%")
@@ -226,9 +286,7 @@ if page == "Predict Disease":
                         # Show probability distribution
                         with st.expander("View detailed probability scores"):
                             
-                            # Create a dictionary to map predicted index to display name
                             prob_data = []
-                            # Iterate based on the indices present in the prediction output (0, 1, 2, 3...)
                             for i, prob in enumerate(all_probs):
                                 display_name = SEVERITY_LEVELS.get(i, f"Class Index {i}")
                                 
@@ -274,67 +332,86 @@ elif page == "Train Model":
     st.header("🎓 Train Disease Detection Model")
     
     st.markdown("""
-    ### Training Instructions:
-    1. Prepare your dataset with the following folder structure:
+    ### Training Dataset Instructions:
+    1. **Format:** Create a **ZIP file** containing your dataset.
+    2. **Structure:** Ensure the ZIP file extracts to a folder containing subfolders for each class:
     ```
-    training_data/
-    ├── healthy/
-    ├── mild/
-    ├── moderate/
-    └── severe/
+    my_dataset.zip
+    └── training_data/
+        ├── healthy/
+        ├── mild/
+        ├── moderate/
+        └── severe/
     ```
-    2. Enter the path to your **training\_data** folder
-    3. Configure training parameters
-    4. Click 'Start Training'
     """)
     
-    # FIX: Corrected the SyntaxError by removing the double asterisk (**)
-    # Set default value to the desired path
-    training_path = st.text_input("Training Data Path", r"F:\ML_images\Trainingdata") 
+    # Option 1: File Uploader (Ideal for deployment)
+    uploaded_zip_file = st.file_uploader(
+        "Upload your dataset as a ZIP file (Recommended)", 
+        type=['zip']
+    )
+    
+    # Option 2: Local Path (Fallback for local development)
+    st.markdown("---")
+    st.markdown("#### **Local Training Path (For local development only)**")
+    # Using the path specified in previous context, but making it optional
+    local_training_path = st.text_input(
+        "Enter path to your data folder (if not uploading a ZIP)", 
+        value=r"F:\ML_images\Trainingdata" # Retain the specific path for convenience
+    )
+    
     epochs = st.slider("Number of Epochs", 5, 50, 10)
     
     if st.button("🚀 Start Training"):
-        if not os.path.exists(training_path):
-            st.error(f"❌ Path not found: {training_path}")
-        else:
-            with st.spinner("Training in progress... This may take several minutes."):
+        model, history, class_indices = None, None, None
+        training_source = None
+        
+        if uploaded_zip_file:
+            # Training via ZIP upload
+            training_source = "ZIP Upload"
+            with st.spinner("Processing ZIP file and starting training..."):
+                model, history, class_indices = unzip_and_train(uploaded_zip_file, epochs)
+        
+        elif local_training_path and os.path.exists(local_training_path):
+            # Training via Local Path
+            training_source = "Local Path"
+            with st.spinner("Starting training from local path..."):
                 try:
-                    # Catch training-specific errors (e.g., no images found)
-                    model, history, class_indices = train_model(training_path, epochs)
-                    
-                    # Save model
-                    save_model(model, class_indices)
-                    
-                    st.success("✅ Model trained and saved successfully!")
-                    
-                    # Display training results
-                    st.subheader("Model Performance Summary")
-                    col1, col2 = st.columns(2)
-                    
-                    with col1:
-                        st.metric("Final Training Accuracy", f"{history.history['accuracy'][-1]*100:.2f}%")
-                    
-                    with col2:
-                        st.metric("Final Validation Accuracy", f"{history.history['val_accuracy'][-1]*100:.2f}%")
-                    
-                    # Plot training history
-                    st.subheader("Training History")
-                    history_df = pd.DataFrame({
-                        'Epoch': range(1, epochs + 1),
-                        'Training Accuracy': history.history['accuracy'],
-                        'Validation Accuracy': history.history['val_accuracy'],
-                        'Training Loss': history.history['loss'],
-                        'Validation Loss': history.history['val_loss']
-                    })
-                    
-                    # Separate charts for clarity
-                    st.line_chart(history_df.set_index('Epoch')[['Training Accuracy', 'Validation Accuracy']])
-                    st.line_chart(history_df.set_index('Epoch')[['Training Loss', 'Validation Loss']])
-                    
+                    model, history, class_indices = train_model(local_training_path, epochs)
                 except (FileNotFoundError, ValueError) as e:
                     st.error(f"❌ Training setup failed: {e}")
                 except Exception as e:
                     st.error(f"❌ Training execution failed: {str(e)}")
+        
+        else:
+            st.error("❌ Please either **upload a ZIP file** or ensure the **Local Training Path** is correct and accessible.")
+            
+        # Display results if training was successful
+        if model is not None:
+            save_model(model, class_indices)
+            
+            st.success(f"✅ Model trained and saved successfully using {training_source}!")
+            
+            st.subheader("Model Performance Summary")
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.metric("Final Training Accuracy", f"{history.history['accuracy'][-1]*100:.2f}%")
+            
+            with col2:
+                st.metric("Final Validation Accuracy", f"{history.history['val_accuracy'][-1]*100:.2f}%")
+            
+            st.subheader("Training History")
+            history_df = pd.DataFrame({
+                'Epoch': range(1, epochs + 1),
+                'Training Accuracy': history.history['accuracy'],
+                'Validation Accuracy': history.history['val_accuracy'],
+                'Training Loss': history.history['loss'],
+                'Validation Loss': history.history['val_loss']
+            })
+            
+            st.line_chart(history_df.set_index('Epoch')[['Training Accuracy', 'Validation Accuracy']])
+            st.line_chart(history_df.set_index('Epoch')[['Training Loss', 'Validation Loss']])
 
 else:  # About page
     st.header("ℹ️ About This Application")
@@ -360,10 +437,9 @@ else:  # About page
     - Progressive leaf damage if untreated
     
     
-    
     #### How to Use:
     1. **Predict Disease**: Upload leaf images for instant analysis
-    2. **Train Model**: Customize the model with your own dataset
+    2. **Train Model**: **Upload your dataset as a ZIP file** or use a local path to customize the model.
     3. **Download Results**: Export predictions for record keeping
     
     #### Technical Details:
