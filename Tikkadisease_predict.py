@@ -21,6 +21,7 @@ st.set_page_config(
 # Constants
 IMG_SIZE = 224
 BATCH_SIZE = 32
+# Ensure SEVERITY_LEVELS keys match the expected output indices (0, 1, 2, 3)
 SEVERITY_LEVELS = {
     0: "Healthy",
     1: "Mild Tikka Disease",
@@ -37,11 +38,13 @@ SEVERITY_COLORS = {
 # Model building function
 def create_model(num_classes=4):
     """Create a transfer learning model using MobileNetV2"""
-    base_model = MobileNetV2(
-        input_shape=(IMG_SIZE, IMG_SIZE, 3),
-        include_top=False,
-        weights='imagenet'
-    )
+    # Use context manager for memory efficiency (though less critical here)
+    with st.spinner('Loading base model weights...'):
+        base_model = MobileNetV2(
+            input_shape=(IMG_SIZE, IMG_SIZE, 3),
+            include_top=False,
+            weights='imagenet'
+        )
     base_model.trainable = False
     
     model = keras.Sequential([
@@ -63,6 +66,7 @@ def create_model(num_classes=4):
     return model
 
 # Training function
+@st.cache_resource
 def train_model(training_path, epochs=10):
     """Train the model on provided dataset"""
     
@@ -79,14 +83,21 @@ def train_model(training_path, epochs=10):
         shear_range=0.2
     )
     
-    train_generator = train_datagen.flow_from_directory(
-        training_path,
-        target_size=(IMG_SIZE, IMG_SIZE),
-        batch_size=BATCH_SIZE,
-        class_mode='categorical',
-        subset='training'
-    )
-    
+    # Check if any images are found
+    try:
+        train_generator = train_datagen.flow_from_directory(
+            training_path,
+            target_size=(IMG_SIZE, IMG_SIZE),
+            batch_size=BATCH_SIZE,
+            class_mode='categorical',
+            subset='training'
+        )
+    except Exception as e:
+        raise FileNotFoundError(f"Error loading training data. Check the path and folder structure: {e}")
+
+    if train_generator.samples == 0:
+        raise ValueError("No training images found in the specified path. Check subdirectories.")
+
     val_generator = train_datagen.flow_from_directory(
         training_path,
         target_size=(IMG_SIZE, IMG_SIZE),
@@ -115,27 +126,33 @@ def predict_image(model, image, class_indices):
     img_array = np.expand_dims(img_array, axis=0)
     
     predictions = model.predict(img_array, verbose=0)
-    predicted_class = np.argmax(predictions[0])
-    confidence = predictions[0][predicted_class] * 100
     
-    # Get class name
-    class_names = {v: k for k, v in class_indices.items()}
-    severity_name = class_names.get(predicted_class, f"Class {predicted_class}")
+    # Check if the number of classes in the loaded model matches SEVERITY_LEVELS
+    if predictions.shape[1] != len(SEVERITY_LEVELS):
+        st.warning(f"Model was trained with {predictions.shape[1]} classes, but expected {len(SEVERITY_LEVELS)}. Results might be mapped incorrectly.")
+
+    predicted_class_index = np.argmax(predictions[0])
+    confidence = predictions[0][predicted_class_index] * 100
     
-    return predicted_class, confidence, severity_name, predictions[0]
+    # MODIFICATION: Use SEVERITY_LEVELS based on the index for display
+    # We rely on the class_indices map to link folder names to indices for proper mapping
+    # The actual class index (0, 1, 2, 3) must be the key for SEVERITY_LEVELS.
+    severity_name = SEVERITY_LEVELS.get(predicted_class_index, f"Unknown Class Index {predicted_class_index}")
+    
+    return predicted_class_index, confidence, severity_name, predictions[0]
 
 # Save/Load model functions
-def save_model(model, class_indices):
-    """Save model and class indices"""
-    model.save('tikka_disease_model.h5')
-    np.save('class_indices.npy', class_indices)
-    
+@st.cache_resource
 def load_model():
     """Load saved model and class indices"""
     if os.path.exists('tikka_disease_model.h5') and os.path.exists('class_indices.npy'):
-        model = keras.models.load_model('tikka_disease_model.h5')
-        class_indices = np.load('class_indices.npy', allow_pickle=True).item()
-        return model, class_indices
+        try:
+            model = keras.models.load_model('tikka_disease_model.h5')
+            class_indices = np.load('class_indices.npy', allow_pickle=True).item()
+            return model, class_indices
+        except Exception as e:
+            st.error(f"Failed to load model or indices: {e}")
+            return None, None
     return None, None
 
 # Streamlit UI
@@ -150,7 +167,7 @@ page = st.sidebar.radio("Select Page", ["Predict Disease", "Train Model", "About
 if page == "Predict Disease":
     st.header("📸 Upload Groundnut Leaf Images")
     
-    # Load model
+    # Load model (using cached function)
     model, class_indices = load_model()
     
     if model is None:
@@ -188,6 +205,7 @@ if page == "Predict Disease":
                         st.image(image, caption=uploaded_file.name, use_container_width=True)
                         
                         # Display prediction
+                        # Use the predicted index for color mapping
                         severity_color = SEVERITY_COLORS.get(pred_class, "gray")
                         st.markdown(f"**Status:** :{severity_color}[{severity_name}]")
                         st.markdown(f"**Confidence:** {confidence:.2f}%")
@@ -202,28 +220,21 @@ if page == "Predict Disease":
                             st.warning("⚠️ Mild disease detected. Monitor closely and consider preventive measures.")
                         elif pred_class == 2:
                             st.warning("⚠️ Moderate disease. Apply fungicide treatment recommended for Tikka disease.")
-                        else:
+                        else: # pred_class == 3
                             st.error("🚨 Severe disease. Immediate fungicide treatment required. Consult agricultural expert.")
                         
                         # Show probability distribution
                         with st.expander("View detailed probability scores"):
-                            # Map numerical indices to severity names
-                            class_map = {v: SEVERITY_LEVELS.get(int(k), f"Class {k}") for k, v in class_indices.items()}
                             
+                            # Create a dictionary to map predicted index to display name
                             prob_data = []
-                            # Ensure all classes in class_indices are included and probabilities are aligned
-                            sorted_indices = sorted(class_indices.values())
-                            sorted_class_names = [class_map.get(i, f"Class {i}") for i in sorted_indices]
-                            
-                            for i in sorted_indices:
-                                # Find the original class name (key) corresponding to the index (value)
-                                original_class_key = next((k for k, v in class_indices.items() if v == i), f"Class {i}")
-                                # Use SEVERITY_LEVELS for display if available, fallback to original key
-                                display_name = SEVERITY_LEVELS.get(i, original_class_key)
+                            # Iterate based on the indices present in the prediction output (0, 1, 2, 3...)
+                            for i, prob in enumerate(all_probs):
+                                display_name = SEVERITY_LEVELS.get(i, f"Class Index {i}")
                                 
                                 prob_data.append({
                                     'Severity Level': display_name,
-                                    'Probability (%)': all_probs[i] * 100
+                                    'Probability (%)': prob * 100
                                 })
                                 
                             prob_df = pd.DataFrame(prob_data)
@@ -277,8 +288,9 @@ elif page == "Train Model":
     4. Click 'Start Training'
     """)
     
-    # MODIFICATION: Set the default value to the desired path
-    training_path = st.text_input("Training Data Path", **r"F:\ML_images\Trainingdata"**) 
+    # FIX: Corrected the SyntaxError by removing the double asterisk (**)
+    # Set default value to the desired path
+    training_path = st.text_input("Training Data Path", r"F:\ML_images\Trainingdata") 
     epochs = st.slider("Number of Epochs", 5, 50, 10)
     
     if st.button("🚀 Start Training"):
@@ -287,6 +299,7 @@ elif page == "Train Model":
         else:
             with st.spinner("Training in progress... This may take several minutes."):
                 try:
+                    # Catch training-specific errors (e.g., no images found)
                     model, history, class_indices = train_model(training_path, epochs)
                     
                     # Save model
@@ -295,6 +308,7 @@ elif page == "Train Model":
                     st.success("✅ Model trained and saved successfully!")
                     
                     # Display training results
+                    st.subheader("Model Performance Summary")
                     col1, col2 = st.columns(2)
                     
                     with col1:
@@ -308,12 +322,19 @@ elif page == "Train Model":
                     history_df = pd.DataFrame({
                         'Epoch': range(1, epochs + 1),
                         'Training Accuracy': history.history['accuracy'],
-                        'Validation Accuracy': history.history['val_accuracy']
+                        'Validation Accuracy': history.history['val_accuracy'],
+                        'Training Loss': history.history['loss'],
+                        'Validation Loss': history.history['val_loss']
                     })
-                    st.line_chart(history_df.set_index('Epoch'))
                     
+                    # Separate charts for clarity
+                    st.line_chart(history_df.set_index('Epoch')[['Training Accuracy', 'Validation Accuracy']])
+                    st.line_chart(history_df.set_index('Epoch')[['Training Loss', 'Validation Loss']])
+                    
+                except (FileNotFoundError, ValueError) as e:
+                    st.error(f"❌ Training setup failed: {e}")
                 except Exception as e:
-                    st.error(f"❌ Training failed: {str(e)}")
+                    st.error(f"❌ Training execution failed: {str(e)}")
 
 else:  # About page
     st.header("ℹ️ About This Application")
@@ -321,8 +342,7 @@ else:  # About page
     st.markdown("""
     ### Groundnut Tikka Disease Detection System
     
-    This application uses deep learning to identify and assess the severity of Tikka disease 
-    (also known as leaf spot disease) in groundnut (peanut) plants.
+    This application uses deep learning to identify and assess the severity of **Tikka disease** (also known as leaf spot disease) in groundnut (peanut) plants.
     
     #### Features:
     - **AI-Powered Detection**: Uses **MobileNetV2** transfer learning for accurate classification
@@ -338,6 +358,8 @@ else:  # About page
     - Brown to black lesions
     - Yellow halos around spots
     - Progressive leaf damage if untreated
+    
+    
     
     #### How to Use:
     1. **Predict Disease**: Upload leaf images for instant analysis
